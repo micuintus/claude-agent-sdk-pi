@@ -1,10 +1,9 @@
 import { calculateCost, createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource, type ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
-import type { Base64ImageSource, CacheControlEphemeral, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
+import type { Base64ImageSource, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
 import { pascalCase } from "change-case";
-import { existsSync, readFileSync } from "fs";
-import { createRequire } from "module";
+import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import { homedir } from "os";
 import { dirname, join, relative, resolve } from "path";
 
@@ -44,245 +43,44 @@ const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 const PROJECT_SETTINGS_PATH = join(process.cwd(), ".pi", "settings.json");
 const GLOBAL_AGENTS_PATH = join(homedir(), ".pi", "agent", "AGENTS.md");
 
-const TOOL_WATCH_CUSTOM_TYPE = "claude-agent-sdk-tool-watch";
-const MAX_TRACKED_TOOL_EXECUTIONS = 256;
-const MAX_TRACKED_TOOL_CONTENT_CHARS = 4000;
-const MAX_LEDGER_TOOL_RESULTS = 4;
-const MAX_LEDGER_TOOL_CONTENT_CHARS = 1200;
+const SDK_SESSION_CUSTOM_TYPE = "claude-agent-sdk";
 
-type ToolWatchCustomEntryData = {
-	type: "tool_execution_end";
-	toolCallId: string;
-	toolName: string;
-	content: string;
-	isError: boolean;
-	timestamp: number;
+type SdkSessionEntryData = {
+	providerId?: string;
+	sdkSessionId?: string;
+	sdkAssistantUuid?: string;
+	assistantTimestamp?: number;
+	pendingToolUseTimestamp?: number | null;
+	pendingToolUseIds?: string[] | null;
 };
 
-type TrackedToolExecution = {
-	toolCallId: string;
-	toolName: string;
-	content: string;
-	isError: boolean;
-	timestamp: number;
+type SdkSessionState = {
+	sdkSessionId?: string;
+	uuidByAssistantTimestamp: Map<number, string>;
+	maxTimestamp?: number;
+	pendingToolUseTimestamp?: number;
+	pendingToolUseIds?: string[];
 };
 
-type SessionToolWatchState = {
-	completedToolCalls: Map<string, TrackedToolExecution>;
+type SessionSdkState = {
+	branch: SdkSessionState;
+	all: SdkSessionState;
 };
 
-const toolWatchStateBySession = new Map<string, SessionToolWatchState>();
+const sdkStateBySessionKey = new Map<string, SessionSdkState>();
 
-function createEmptyToolWatchState(): SessionToolWatchState {
-	return {
-		completedToolCalls: new Map(),
-	};
-}
+type PiSessionSdkStateCacheEntry = {
+	sessionFilePath: string;
+	mtimeMs: number;
+	size: number;
+	state: SdkSessionState;
+};
 
-function getOrCreateToolWatchState(sessionKey: string): SessionToolWatchState {
-	const existing = toolWatchStateBySession.get(sessionKey);
-	if (existing) return existing;
-	const created = createEmptyToolWatchState();
-	toolWatchStateBySession.set(sessionKey, created);
-	return created;
-}
+const piSessionSdkStateCache = new Map<string, PiSessionSdkStateCacheEntry>();
+const piSessionFilePathCache = new Map<string, string>();
+const piSessionFileBySessionKey = new Map<string, string>();
 
-function getSessionKeyFromSessionId(sessionId?: string): string | undefined {
-	if (!sessionId) return undefined;
-	return `session:${sessionId}`;
-}
-
-function getSessionKeyFromStreamOptions(options?: SimpleStreamOptions): string | undefined {
-	return getSessionKeyFromSessionId(options?.sessionId);
-}
-
-function getSessionKeyFromContext(ctx?: { sessionManager?: { getSessionId?: () => string } }): string | undefined {
-	const sessionId = ctx?.sessionManager?.getSessionId?.();
-	if (!sessionId) return undefined;
-	return getSessionKeyFromSessionId(sessionId);
-}
-
-function truncateText(text: string, limit: number): string {
-	if (text.length <= limit) return text;
-	return `${text.slice(0, limit)}\n...[truncated]`;
-}
-
-function stringifyUnknown(value: unknown): string {
-	if (typeof value === "string") return value;
-	try {
-		return JSON.stringify(value, null, 2);
-	} catch {
-		return String(value);
-	}
-}
-
-function contentToPlainText(
-	content:
-		| string
-		| Array<{
-			type?: string;
-			text?: string;
-			mimeType?: string;
-		}>
-		| undefined,
-): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((block) => {
-			if (block?.type === "text") return block.text ?? "";
-			if (block?.type === "image") return `[image:${block.mimeType ?? "unknown"}]`;
-			if (block?.type) return `[${block.type}]`;
-			return "";
-		})
-		.filter((line) => line.length > 0)
-		.join("\n");
-}
-
-function extractToolExecutionContent(result: unknown): string {
-	if (result && typeof result === "object" && "content" in result) {
-		const objectResult = result as { content?: unknown };
-		const text = contentToPlainText(
-			Array.isArray(objectResult.content)
-				? (objectResult.content as Array<{ type?: string; text?: string; mimeType?: string }>)
-				: undefined,
-		);
-		if (text) return truncateText(text, MAX_TRACKED_TOOL_CONTENT_CHARS);
-	}
-	const fallback = stringifyUnknown(result);
-	return truncateText(fallback, MAX_TRACKED_TOOL_CONTENT_CHARS);
-}
-
-function collectAssistantToolCalls(message: unknown): Array<{ id: string; name: string }> {
-	if (!message || typeof message !== "object") return [];
-	const assistantMessage = message as {
-		role?: string;
-		content?: Array<{ type?: string; id?: string; name?: string }>;
-	};
-	if (assistantMessage.role !== "assistant" || !Array.isArray(assistantMessage.content)) return [];
-	return assistantMessage.content
-		.filter((block): block is { type: "toolCall"; id: string; name: string } => {
-			return block?.type === "toolCall" && typeof block.id === "string" && typeof block.name === "string";
-		})
-		.map((block) => ({ id: block.id, name: block.name }));
-}
-
-function trackCompletedToolCall(sessionKey: string, execution: TrackedToolExecution): void {
-	const state = getOrCreateToolWatchState(sessionKey);
-	state.completedToolCalls.delete(execution.toolCallId);
-	state.completedToolCalls.set(execution.toolCallId, execution);
-	while (state.completedToolCalls.size > MAX_TRACKED_TOOL_EXECUTIONS) {
-		const oldestKey = state.completedToolCalls.keys().next().value;
-		if (!oldestKey) break;
-		state.completedToolCalls.delete(oldestKey);
-	}
-}
-
-function trackCompletedToolResultMessage(
-	sessionKey: string,
-	message: {
-		toolCallId?: unknown;
-		toolName?: unknown;
-		content?: unknown;
-		isError?: unknown;
-		timestamp?: unknown;
-	},
-): void {
-	if (typeof message.toolCallId !== "string" || typeof message.toolName !== "string") return;
-	trackCompletedToolCall(sessionKey, {
-		toolCallId: message.toolCallId,
-		toolName: message.toolName,
-		content: truncateText(contentToPlainText(message.content as any), MAX_TRACKED_TOOL_CONTENT_CHARS),
-		isError: message.isError === true,
-		timestamp: typeof message.timestamp === "number" ? message.timestamp : Date.now(),
-	});
-}
-
-function hydrateToolWatchStateFromEntries(sessionKey: string, entries: Array<Record<string, any>>): void {
-	toolWatchStateBySession.set(sessionKey, createEmptyToolWatchState());
-	for (const entry of entries) {
-		if (entry.type === "message" && entry.message?.role === "toolResult") {
-			trackCompletedToolResultMessage(sessionKey, entry.message);
-		}
-	}
-	for (const entry of entries) {
-		if (entry.type === "custom" && entry.customType === TOOL_WATCH_CUSTOM_TYPE) {
-			const data = entry.data as ToolWatchCustomEntryData | undefined;
-			if (!data || data.type !== "tool_execution_end") continue;
-			if (!data.toolCallId || !data.toolName) continue;
-			trackCompletedToolCall(sessionKey, {
-				toolCallId: data.toolCallId,
-				toolName: data.toolName,
-				content: truncateText(data.content ?? "", MAX_TRACKED_TOOL_CONTENT_CHARS),
-				isError: data.isError === true,
-				timestamp: typeof data.timestamp === "number" ? data.timestamp : Date.now(),
-			});
-		}
-	}
-}
-
-function reconcileCompletedToolCallsWithContext(sessionKey: string, context: Context): void {
-	for (const message of context.messages) {
-		if (message.role !== "toolResult") continue;
-		trackCompletedToolResultMessage(sessionKey, message);
-	}
-}
-
-function buildToolWatchPromptNote(
-	sessionKey: string | undefined,
-	context: Context,
-	customToolNameToSdk?: Map<string, string>,
-): string | undefined {
-	if (!sessionKey) return undefined;
-	const state = toolWatchStateBySession.get(sessionKey) ?? createEmptyToolWatchState();
-
-	const toolResultIdsInContext = new Set<string>();
-	const assistantToolCallsInContext = new Map<string, { toolName: string; timestamp: number }>();
-	for (const message of context.messages) {
-		if (message.role === "assistant") {
-			for (const toolCall of collectAssistantToolCalls(message)) {
-				assistantToolCallsInContext.set(toolCall.id, {
-					toolName: toolCall.name,
-					timestamp: message.timestamp,
-				});
-			}
-			continue;
-		}
-		if (message.role === "toolResult") {
-			toolResultIdsInContext.add(message.toolCallId);
-		}
-	}
-
-	const missingToolCalls = Array.from(assistantToolCallsInContext.entries())
-		.filter(([toolCallId]) => !toolResultIdsInContext.has(toolCallId))
-		.sort((a, b) => b[1].timestamp - a[1].timestamp)
-		.slice(0, MAX_LEDGER_TOOL_RESULTS);
-
-	if (!missingToolCalls.length) return undefined;
-
-	const parts: string[] = [];
-
-	for (const [toolCallId, pending] of missingToolCalls) {
-		const execution = state.completedToolCalls.get(toolCallId);
-		if (execution) {
-			const sdkToolName = mapPiToolNameToSdk(execution.toolName, customToolNameToSdk);
-			const status = execution.isError ? "error" : "ok";
-			const content = truncateText(execution.content || "(empty tool result)", MAX_LEDGER_TOOL_CONTENT_CHARS);
-			parts.push(
-				`TOOL RESULT (recovered ${sdkToolName}, id=${execution.toolCallId}, status=${status}):\n${content}`,
-			);
-			continue;
-		}
-
-		const sdkToolName = mapPiToolNameToSdk(pending.toolName, customToolNameToSdk);
-		parts.push(
-			`TOOL RESULT (missing execution ${sdkToolName}, id=${toolCallId}, status=error):\n` +
-				"Tool execution did not complete or its result was not observed. Do not guess. Call the tool again.",
-		);
-	}
-
-	return parts.join("\n\n");
-}
+let extensionApi: ExtensionAPI | undefined;
 
 const MODELS = getModels("anthropic").map((model) => ({
 	id: model.id,
@@ -298,7 +96,6 @@ const MODELS = getModels("anthropic").map((model) => ({
 function buildPromptBlocks(
 	context: Context,
 	customToolNameToSdk: Map<string, string> | undefined,
-	toolWatchNote?: string,
 ): ContentBlockParam[] {
 	const blocks: ContentBlockParam[] = [];
 
@@ -377,18 +174,13 @@ function buildPromptBlocks(
 		}
 
 		if (message.role === "toolResult") {
-			const header = `TOOL RESULT (historical ${mapPiToolNameToSdk(message.toolName, customToolNameToSdk)}, id=${message.toolCallId}):`;
+			const header = `TOOL RESULT (historical ${mapPiToolNameToSdk(message.toolName, customToolNameToSdk)}):`;
 			pushPrefix(header);
 			const hasText = appendContentBlocks(message.content);
 			if (!hasText) {
 				pushText("(see attached image)");
 			}
 		}
-	}
-
-	if (toolWatchNote && toolWatchNote.trim().length > 0) {
-		pushPrefix("RECOVERED TOOL RESULTS:");
-		pushText(toolWatchNote.trim());
 	}
 
 	if (!blocks.length) return [{ type: "text", text: "" }];
@@ -399,7 +191,7 @@ function buildPromptBlocks(
 function buildPromptStream(promptBlocks: ContentBlockParam[]): AsyncIterable<SDKUserMessage> {
 	async function* generator() {
 		const message: SDKUserMessage = {
-			type: "user",
+			type: "user" as const,
 			message: {
 				role: "user",
 				content: promptBlocks,
@@ -440,6 +232,443 @@ function contentToText(
 			return `[${block.type}]`;
 		})
 		.join("\n");
+}
+
+function convertPiContentToBlocks(
+	content:
+		| string
+		| Array<{
+			type: string;
+			text?: string;
+			data?: string;
+			mimeType?: string;
+		}>,
+	supportsImages: boolean,
+): string | ContentBlockParam[] {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	const blocks: ContentBlockParam[] = [];
+	let hasText = false;
+	let hasImage = false;
+	for (const block of content) {
+		if (block.type === "text") {
+			const text = block.text ?? "";
+			if (text.trim().length > 0) hasText = true;
+			blocks.push({ type: "text", text });
+			continue;
+		}
+		if (block.type === "image") {
+			if (!supportsImages) continue;
+			hasImage = true;
+			blocks.push({
+				type: "image",
+				source: {
+					type: "base64",
+					media_type: block.mimeType as Base64ImageSource["media_type"],
+					data: block.data ?? "",
+				},
+			} satisfies ImageBlockParam);
+			continue;
+		}
+		blocks.push({ type: "text", text: `[${block.type}]` } as TextBlockParam);
+	}
+	if (!blocks.length) {
+		return supportsImages ? "(see attached image)" : "(image omitted)";
+	}
+	if (!hasText && hasImage) {
+		blocks.unshift({ type: "text", text: "(see attached image)" } as TextBlockParam);
+	}
+	return blocks;
+}
+
+function contentToPlainText(
+	content:
+		| string
+		| Array<{
+			type: string;
+			text?: string;
+			data?: string;
+			mimeType?: string;
+		}>,
+): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	let text = "";
+	let hasText = false;
+	let hasImage = false;
+	for (const block of content) {
+		if (block.type === "text") {
+			const value = block.text ?? "";
+			if (value.trim().length > 0) hasText = true;
+			text += `${text ? "\n" : ""}${value}`;
+			continue;
+		}
+		if (block.type === "image") {
+			hasImage = true;
+			continue;
+		}
+		text += `${text ? "\n" : ""}[${block.type}]`;
+	}
+	if (!hasText && hasImage) {
+		return "(see attached image)";
+	}
+	return text;
+}
+
+function buildHistoricalSummary(messages: Context["messages"], customToolNameToSdk?: Map<string, string>): string {
+	const lines: string[] = [];
+	for (const message of messages) {
+		if (message.role === "user") {
+			const text = contentToPlainText(message.content);
+			if (text.trim().length > 0) lines.push(`USER: ${text}`);
+			else lines.push("USER: (see attached image)");
+			continue;
+		}
+		if (message.role === "assistant") {
+			const text = contentToText(message.content, customToolNameToSdk);
+			if (text.trim().length > 0) lines.push(`ASSISTANT: ${text}`);
+			continue;
+		}
+		if (message.role === "toolResult") {
+			const toolName = mapPiToolNameToSdk(message.toolName, customToolNameToSdk);
+			const text = contentToPlainText(message.content);
+			if (text.trim().length > 0) {
+				lines.push(`TOOL RESULT (historical ${toolName}): ${text}`);
+			} else {
+				lines.push(`TOOL RESULT (historical ${toolName}): (see attached image)`);
+			}
+		}
+	}
+	if (!lines.length) return "";
+	return `Historical context (non-executable):\n${lines.join("\n")}`;
+}
+
+function buildPromptWithSummary(
+	summaryText: string,
+	userMessage: Extract<Context["messages"][number], { role: "user" }> | undefined,
+	supportsImages: boolean,
+): AsyncIterable<SDKUserMessage> | string {
+	if (!summaryText && !userMessage) return "";
+
+	async function* generator() {
+		const trimmedSummary = summaryText.trim();
+		if (!userMessage) {
+			if (trimmedSummary.length > 0) {
+				yield {
+					type: "user" as const,
+					message: { role: "user", content: trimmedSummary } as MessageParam,
+					parent_tool_use_id: null,
+					session_id: "prompt",
+				};
+			}
+			return;
+		}
+
+		const content = convertPiContentToBlocks(userMessage.content, supportsImages);
+		if (typeof content === "string") {
+			const trimmedUser = content.trim();
+			const parts = [trimmedSummary].filter((part) => part.length > 0);
+			if (trimmedUser.length > 0) {
+				parts.push(`---\nLatest user message:\n${trimmedUser}`);
+			}
+			if (parts.length > 0) {
+				yield {
+					type: "user" as const,
+					message: { role: "user", content: parts.join("\n\n") } as MessageParam,
+					parent_tool_use_id: null,
+					session_id: "prompt",
+				};
+			}
+			return;
+		}
+
+		if (content.length > 0) {
+			const blocks: ContentBlockParam[] = [];
+			if (trimmedSummary.length > 0) {
+				blocks.push({
+					type: "text",
+					text: `${trimmedSummary}\n\n---\nLatest user message:`,
+				} as TextBlockParam);
+			}
+			blocks.push(...content);
+			yield {
+				type: "user" as const,
+				message: { role: "user", content: blocks } as MessageParam,
+				parent_tool_use_id: null,
+				session_id: "prompt",
+			};
+			return;
+		}
+
+		if (trimmedSummary.length > 0) {
+			yield {
+				type: "user" as const,
+				message: { role: "user", content: trimmedSummary } as MessageParam,
+				parent_tool_use_id: null,
+				session_id: "prompt",
+			};
+		}
+	}
+
+	return generator();
+}
+
+function normalizeToolResultContent(
+	content: string | ContentBlockParam[],
+	isError: boolean,
+): string | ContentBlockParam[] {
+	const fallback = isError ? "(tool error with no output)" : "(no output)";
+	if (typeof content === "string") {
+		return content.trim().length > 0 ? content : fallback;
+	}
+	if (!Array.isArray(content) || content.length === 0) {
+		return fallback;
+	}
+	const hasImage = content.some((block) => block.type === "image");
+	const hasText = content.some((block) => block.type === "text" && "text" in block && block.text?.trim());
+	if (!hasImage && !hasText) {
+		return [{ type: "text", text: fallback }];
+	}
+	return content;
+}
+
+function collectToolResultIds(messages: Context["messages"]): Set<string> {
+	const ids = new Set<string>();
+	for (const message of messages) {
+		if (message.role !== "toolResult") continue;
+		const id = (message as Extract<Context["messages"][number], { role: "toolResult" }>).toolCallId;
+		if (typeof id === "string" && id.trim().length > 0) {
+			ids.add(id);
+		}
+	}
+	return ids;
+}
+
+type ResumeTailPlan = {
+	tailHasAssistant: boolean;
+	summaryMessages: Context["messages"];
+	userMessage?: Extract<Context["messages"][number], { role: "user" }>;
+	shouldReplayPendingToolResults: boolean;
+	shouldUseSummaryPrompt: boolean;
+	tailAllowedToolUseIds?: Set<string>;
+};
+
+function analyzeResumeTailMessages(
+	tailMessages: Context["messages"],
+	pendingToolUseTimestamp?: number,
+): ResumeTailPlan {
+	const tailHasAssistant = tailMessages.some((message) => message.role === "assistant");
+	let lastUserIndex = -1;
+	for (let i = tailMessages.length - 1; i >= 0; i -= 1) {
+		if (tailMessages[i]?.role === "user") {
+			lastUserIndex = i;
+			break;
+		}
+	}
+
+	const summaryMessages = lastUserIndex >= 0 ? tailMessages.slice(0, lastUserIndex) : tailMessages;
+	const userMessage =
+		lastUserIndex >= 0
+			? (tailMessages[lastUserIndex] as Extract<Context["messages"][number], { role: "user" }>)
+			: undefined;
+	const shouldReplayPendingToolResults = pendingToolUseTimestamp != null && !tailHasAssistant;
+	const shouldUseSummaryPrompt = summaryMessages.length > 0 && !shouldReplayPendingToolResults;
+	const tailAllowedToolUseIds = shouldUseSummaryPrompt
+		? undefined
+		: shouldReplayPendingToolResults
+			? collectToolResultIds(tailMessages)
+			: new Set<string>();
+
+	return {
+		tailHasAssistant,
+		summaryMessages,
+		userMessage,
+		shouldReplayPendingToolResults,
+		shouldUseSummaryPrompt,
+		tailAllowedToolUseIds,
+	};
+}
+
+function hasReplayableTailMessages(tailMessages: Context["messages"] | undefined): boolean {
+	if (!tailMessages || tailMessages.length === 0) {
+		return false;
+	}
+	for (const message of tailMessages) {
+		if (message.role === "user" || message.role === "toolResult") {
+			return true;
+		}
+	}
+	return false;
+}
+
+type ResumeForkPlan = {
+	resumeSessionAt?: string;
+	forkSession?: boolean;
+};
+
+function computeResumeForkPlan(
+	branchState: SdkSessionState | undefined,
+	allState: SdkSessionState | undefined,
+): ResumeForkPlan {
+	let resumeSessionAt: string | undefined;
+	let forkSession: boolean | undefined;
+
+	if (
+		branchState?.maxTimestamp != null &&
+		allState?.maxTimestamp != null &&
+		branchState.maxTimestamp < allState.maxTimestamp
+	) {
+		resumeSessionAt = branchState.uuidByAssistantTimestamp.get(branchState.maxTimestamp);
+		forkSession = Boolean(resumeSessionAt);
+	}
+
+	if (branchState?.pendingToolUseTimestamp != null) {
+		const pendingUuid = branchState.uuidByAssistantTimestamp.get(branchState.pendingToolUseTimestamp);
+		if (pendingUuid) {
+			resumeSessionAt = pendingUuid;
+			forkSession = true;
+		}
+	}
+
+	return { resumeSessionAt, forkSession };
+}
+
+function buildResumePromptFromTail(
+	tailMessages: Context["messages"],
+	supportsImages: boolean,
+	allowedToolUseIds?: Set<string>,
+): AsyncIterable<SDKUserMessage> | string {
+	if (!tailMessages.length) return "";
+
+	const latestAllowedToolResultIndexById = new Map<string, number>();
+	for (let i = 0; i < tailMessages.length; i += 1) {
+		const message = tailMessages[i];
+		if (message?.role !== "toolResult") continue;
+		const toolMessage = message as Extract<Context["messages"][number], { role: "toolResult" }>;
+		if (allowedToolUseIds && !allowedToolUseIds.has(toolMessage.toolCallId)) continue;
+		latestAllowedToolResultIndexById.set(toolMessage.toolCallId, i);
+	}
+
+	async function* generator() {
+		let index = 0;
+		while (index < tailMessages.length) {
+			const message = tailMessages[index];
+			if (message.role === "user") {
+				const content = convertPiContentToBlocks(message.content, supportsImages);
+				if (typeof content === "string") {
+					if (content.trim().length > 0) {
+						yield {
+							type: "user" as const,
+							message: { role: "user", content } as MessageParam,
+							parent_tool_use_id: null,
+							session_id: "prompt",
+						};
+					}
+				} else if (content.length > 0) {
+					yield {
+						type: "user" as const,
+						message: { role: "user", content } as MessageParam,
+						parent_tool_use_id: null,
+						session_id: "prompt",
+					};
+				}
+				index += 1;
+				continue;
+			}
+
+			if (message.role === "toolResult") {
+				const toolResults: ContentBlockParam[] = [];
+				const toolResultIndexById = new Map<string, number>();
+				const skippedSummaries: string[] = [];
+				while (index < tailMessages.length && tailMessages[index]?.role === "toolResult") {
+					const toolMessage = tailMessages[index] as Extract<
+						Context["messages"][number],
+						{ role: "toolResult" }
+					>;
+					const isAllowedId = !allowedToolUseIds || allowedToolUseIds.has(toolMessage.toolCallId);
+					const isLatestAllowed = latestAllowedToolResultIndexById.get(toolMessage.toolCallId) === index;
+					const shouldInclude = isAllowedId && isLatestAllowed;
+					if (shouldInclude) {
+						const content = convertPiContentToBlocks(toolMessage.content, supportsImages);
+						const normalizedContent = normalizeToolResultContent(
+							content,
+							Boolean(toolMessage.isError),
+						);
+						const existingIndex = toolResultIndexById.get(toolMessage.toolCallId);
+						const toolResult: ContentBlockParam = {
+							type: "tool_result",
+							tool_use_id: toolMessage.toolCallId,
+							content: normalizedContent,
+							is_error: toolMessage.isError,
+						} as ContentBlockParam;
+						if (existingIndex == null) {
+							toolResultIndexById.set(toolMessage.toolCallId, toolResults.length);
+							toolResults.push(toolResult);
+						} else {
+							toolResults[existingIndex] = toolResult;
+						}
+					} else if (!isAllowedId) {
+						const plain = contentToPlainText(toolMessage.content).trim();
+						skippedSummaries.push(
+							`TOOL RESULT (already recorded ${toolMessage.toolName}, id=${toolMessage.toolCallId}): ${plain || (toolMessage.isError ? "(tool error with no output)" : "(no output)")}`,
+						);
+					}
+					index += 1;
+				}
+				if (toolResults.length > 0) {
+					yield {
+						type: "user" as const,
+						message: { role: "user", content: toolResults } as MessageParam,
+						parent_tool_use_id: null,
+						session_id: "prompt",
+					};
+				} else if (skippedSummaries.length > 0) {
+					yield {
+						type: "user" as const,
+						message: {
+							role: "user",
+							content: `Continue using the already-recorded tool outputs:\n${skippedSummaries.join("\n")}`,
+						} as MessageParam,
+						parent_tool_use_id: null,
+						session_id: "prompt",
+					};
+				}
+				continue;
+			}
+
+			index += 1;
+		}
+	}
+
+	return generator();
+}
+
+function isErroredAssistantMessage(message: Extract<Context["messages"][number], { role: "assistant" }>): boolean {
+	if (message.stopReason === "error") return true;
+	if (typeof message.errorMessage === "string" && message.errorMessage.trim().length > 0) return true;
+	const text = contentToText(message.content).trim().toLowerCase();
+	if (!text) return false;
+	if (text.startsWith("api error:")) return true;
+	if (text.includes("does not support assistant message prefill")) return true;
+	return false;
+}
+
+function findLastSdkAssistantInfo(
+	messages: Context["messages"],
+	state: SdkSessionState | undefined,
+): { index: number; timestamp: number; uuid: string } | undefined {
+	if (!state) return undefined;
+	for (let i = messages.length - 1; i >= 0; i -= 1) {
+		const message = messages[i];
+		if (message?.role !== "assistant") continue;
+		if (isErroredAssistantMessage(message)) continue;
+		const timestamp = message.timestamp;
+		const uuid = state.uuidByAssistantTimestamp.get(timestamp);
+		if (uuid) {
+			return { index: i, timestamp, uuid };
+		}
+	}
+	return undefined;
 }
 
 function mapPiToolNameToSdk(name?: string, customToolNameToSdk?: Map<string, string>): string {
@@ -529,6 +758,487 @@ function readSettingsFile(filePath: string): ProviderSettings {
 	} catch {
 		return {};
 	}
+}
+
+function buildSessionKey(options: SimpleStreamOptions | undefined, cwd: string): string | undefined {
+	const sessionId = (options as { sessionId?: string } | undefined)?.sessionId;
+	if (typeof sessionId === "string" && sessionId.trim().length > 0) {
+		return `session:${sessionId.trim()}`;
+	}
+	if (cwd && cwd.trim().length > 0) {
+		return `cwd:${cwd}`;
+	}
+	return undefined;
+}
+
+function getSessionKeyFromManager(sessionManager: { getSessionId: () => string }): string {
+	return `session:${sessionManager.getSessionId()}`;
+}
+
+function createEmptySdkState(): SdkSessionState {
+	return {
+		sdkSessionId: undefined,
+		uuidByAssistantTimestamp: new Map(),
+		maxTimestamp: undefined,
+		pendingToolUseTimestamp: undefined,
+		pendingToolUseIds: undefined,
+	};
+}
+
+function cloneSdkState(state: SdkSessionState): SdkSessionState {
+	return {
+		sdkSessionId: state.sdkSessionId,
+		uuidByAssistantTimestamp: new Map(state.uuidByAssistantTimestamp),
+		maxTimestamp: state.maxTimestamp,
+		pendingToolUseTimestamp: state.pendingToolUseTimestamp,
+		pendingToolUseIds: state.pendingToolUseIds ? [...state.pendingToolUseIds] : undefined,
+	};
+}
+
+function buildSdkStateFromEntries(entries: Array<Record<string, any>>): SdkSessionState {
+	const state = createEmptySdkState();
+	for (const entry of entries) {
+		if (entry?.type !== "custom" || entry?.customType !== SDK_SESSION_CUSTOM_TYPE) continue;
+		const data = entry?.data as SdkSessionEntryData | undefined;
+		if (!data || typeof data !== "object") continue;
+		if (typeof data.sdkSessionId === "string" && data.sdkSessionId.trim().length > 0) {
+			state.sdkSessionId = data.sdkSessionId;
+		}
+		if (
+			typeof data.assistantTimestamp === "number" &&
+			Number.isFinite(data.assistantTimestamp) &&
+			typeof data.sdkAssistantUuid === "string" &&
+			data.sdkAssistantUuid.trim().length > 0
+		) {
+			state.uuidByAssistantTimestamp.set(data.assistantTimestamp, data.sdkAssistantUuid);
+			if (state.maxTimestamp == null || data.assistantTimestamp > state.maxTimestamp) {
+				state.maxTimestamp = data.assistantTimestamp;
+			}
+		}
+		if (data.pendingToolUseTimestamp === null) {
+			state.pendingToolUseTimestamp = undefined;
+		} else if (
+			typeof data.pendingToolUseTimestamp === "number" &&
+			Number.isFinite(data.pendingToolUseTimestamp)
+		) {
+			state.pendingToolUseTimestamp = data.pendingToolUseTimestamp;
+		}
+		if (data.pendingToolUseIds === null) {
+			state.pendingToolUseIds = undefined;
+		} else if (Array.isArray(data.pendingToolUseIds)) {
+			state.pendingToolUseIds = data.pendingToolUseIds.filter(
+				(id): id is string => typeof id === "string" && id.trim().length > 0,
+			);
+		}
+	}
+	return state;
+}
+
+function rebuildSessionState(sessionKey: string, entries: Array<Record<string, any>>, branchEntries: Array<Record<string, any>>): void {
+	const branchState = buildSdkStateFromEntries(branchEntries);
+	const allState = buildSdkStateFromEntries(entries);
+	if (!branchState.sdkSessionId && allState.sdkSessionId) {
+		branchState.sdkSessionId = allState.sdkSessionId;
+	}
+	sdkStateBySessionKey.set(sessionKey, { branch: branchState, all: allState });
+}
+
+function updateSessionState(sessionKey: string, data: SdkSessionEntryData): void {
+	const state = sdkStateBySessionKey.get(sessionKey) ?? {
+		branch: createEmptySdkState(),
+		all: createEmptySdkState(),
+	};
+
+	const apply = (target: SdkSessionState) => {
+		if (typeof data.sdkSessionId === "string" && data.sdkSessionId.trim().length > 0) {
+			target.sdkSessionId = data.sdkSessionId;
+		}
+		if (
+			typeof data.assistantTimestamp === "number" &&
+			Number.isFinite(data.assistantTimestamp) &&
+			typeof data.sdkAssistantUuid === "string" &&
+			data.sdkAssistantUuid.trim().length > 0
+		) {
+			target.uuidByAssistantTimestamp.set(data.assistantTimestamp, data.sdkAssistantUuid);
+			if (target.maxTimestamp == null || data.assistantTimestamp > target.maxTimestamp) {
+				target.maxTimestamp = data.assistantTimestamp;
+			}
+		}
+		if (data.pendingToolUseTimestamp === null) {
+			target.pendingToolUseTimestamp = undefined;
+		} else if (
+			typeof data.pendingToolUseTimestamp === "number" &&
+			Number.isFinite(data.pendingToolUseTimestamp)
+		) {
+			target.pendingToolUseTimestamp = data.pendingToolUseTimestamp;
+		}
+		if (data.pendingToolUseIds === null) {
+			target.pendingToolUseIds = undefined;
+		} else if (Array.isArray(data.pendingToolUseIds)) {
+			target.pendingToolUseIds = data.pendingToolUseIds.filter(
+				(id): id is string => typeof id === "string" && id.trim().length > 0,
+			);
+		}
+	};
+
+	apply(state.branch);
+	apply(state.all);
+	sdkStateBySessionKey.set(sessionKey, state);
+}
+
+function persistSdkEntry(sessionKey: string | undefined, data: SdkSessionEntryData): void {
+	if (!sessionKey) return;
+	updateSessionState(sessionKey, data);
+	if (!extensionApi) return;
+	try {
+		extensionApi.appendEntry(SDK_SESSION_CUSTOM_TYPE, data);
+	} catch {
+		// ignore persistence errors
+	}
+}
+
+function getSessionState(sessionKey: string): SessionSdkState | undefined {
+	return sdkStateBySessionKey.get(sessionKey);
+}
+
+function refreshSessionState(ctx: {
+	sessionManager: {
+		getSessionId: () => string;
+		getEntries: () => any[];
+		getBranch: () => any[];
+		getSessionFile?: () => string | undefined;
+	};
+}): void {
+	const sessionKey = getSessionKeyFromManager(ctx.sessionManager);
+	rebuildSessionState(sessionKey, ctx.sessionManager.getEntries(), ctx.sessionManager.getBranch());
+	const sessionFile = ctx.sessionManager.getSessionFile?.();
+	if (typeof sessionFile === "string" && sessionFile.trim().length > 0) {
+		piSessionFileBySessionKey.set(sessionKey, sessionFile);
+	}
+}
+
+function normalizeClaudeProjectDirName(cwd: string): string {
+	let projectDir = cwd.replace(/[\\/:.]+/g, "-");
+	if (!projectDir.startsWith("-")) projectDir = `-${projectDir}`;
+	return projectDir;
+}
+
+function getClaudeProjectDir(cwd: string): string {
+	return join(homedir(), ".claude", "projects", normalizeClaudeProjectDirName(cwd));
+}
+
+function getSdkSessionFilePath(sessionId: string, cwd: string): string {
+	return join(getClaudeProjectDir(cwd), `${sessionId}.jsonl`);
+}
+
+type ClaudeSessionNode = {
+	parentUuid?: string;
+	toolResultIds: string[];
+	toolUseIds: string[];
+};
+
+function extractToolResultIdsFromClaudeContent(content: unknown): string[] {
+	if (!Array.isArray(content)) return [];
+	const ids: string[] = [];
+	for (const block of content) {
+		if (
+			typeof block === "object" &&
+			block != null &&
+			(block as { type?: unknown }).type === "tool_result" &&
+			typeof (block as { tool_use_id?: unknown }).tool_use_id === "string" &&
+			(block as { tool_use_id: string }).tool_use_id.trim().length > 0
+		) {
+			ids.push((block as { tool_use_id: string }).tool_use_id);
+		}
+	}
+	return ids;
+}
+
+function extractToolUseIdsFromClaudeContent(content: unknown): string[] {
+	if (!Array.isArray(content)) return [];
+	const ids: string[] = [];
+	for (const block of content) {
+		if (
+			typeof block === "object" &&
+			block != null &&
+			(block as { type?: unknown }).type === "tool_use" &&
+			typeof (block as { id?: unknown }).id === "string" &&
+			(block as { id: string }).id.trim().length > 0
+		) {
+			ids.push((block as { id: string }).id);
+		}
+	}
+	return ids;
+}
+
+function collectClaudeSessionNodesFromFile(sessionFilePath: string, nodes: Map<string, ClaudeSessionNode>): void {
+	if (!existsSync(sessionFilePath)) return;
+	let lines: string[];
+	try {
+		lines = readFileSync(sessionFilePath, "utf-8").split("\n");
+	} catch {
+		return;
+	}
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let parsed: any;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		const uuid = typeof parsed?.uuid === "string" ? parsed.uuid : undefined;
+		if (!uuid) continue;
+		const parentUuid = typeof parsed?.parentUuid === "string" ? parsed.parentUuid : undefined;
+		const content = parsed?.message?.content;
+		const toolResultIds = parsed?.type === "user" ? extractToolResultIdsFromClaudeContent(content) : [];
+		const toolUseIds = parsed?.type === "assistant" ? extractToolUseIdsFromClaudeContent(content) : [];
+		const existing = nodes.get(uuid);
+		nodes.set(uuid, {
+			parentUuid: existing?.parentUuid ?? parentUuid,
+			toolResultIds: existing?.toolResultIds?.length ? existing.toolResultIds : toolResultIds,
+			toolUseIds: existing?.toolUseIds?.length ? existing.toolUseIds : toolUseIds,
+		});
+	}
+}
+
+function getPathToRootUuids(nodes: Map<string, ClaudeSessionNode>, anchorUuid: string): string[] {
+	const path: string[] = [];
+	const seen = new Set<string>();
+	let current: string | undefined = anchorUuid;
+	while (current && !seen.has(current)) {
+		path.push(current);
+		seen.add(current);
+		current = nodes.get(current)?.parentUuid;
+	}
+	path.reverse();
+	return path;
+}
+
+function isDescendantOfAnchor(nodes: Map<string, ClaudeSessionNode>, anchorUuid: string, uuid: string): boolean {
+	const seen = new Set<string>();
+	let current: string | undefined = uuid;
+	while (current && !seen.has(current)) {
+		if (current === anchorUuid) return true;
+		seen.add(current);
+		current = nodes.get(current)?.parentUuid;
+	}
+	return false;
+}
+
+function collectRecordedToolResultIdsFromNodes(nodes: Map<string, ClaudeSessionNode>, resumeAnchorUuid?: string): Set<string> {
+	const ids = new Set<string>();
+	const anchor = typeof resumeAnchorUuid === "string" && resumeAnchorUuid.trim().length > 0 ? resumeAnchorUuid : undefined;
+
+	if (!anchor) {
+		for (const node of nodes.values()) {
+			for (const id of node.toolResultIds) ids.add(id);
+		}
+		return ids;
+	}
+
+	for (const uuid of getPathToRootUuids(nodes, anchor)) {
+		const node = nodes.get(uuid);
+		if (!node) continue;
+		for (const id of node.toolResultIds) ids.add(id);
+	}
+
+	for (const [uuid, node] of nodes.entries()) {
+		if (node.toolResultIds.length === 0) continue;
+		if (!isDescendantOfAnchor(nodes, anchor, uuid)) continue;
+		for (const id of node.toolResultIds) ids.add(id);
+	}
+	return ids;
+}
+
+function collectUnresolvedToolUseIdsOnAnchorPath(
+	nodes: Map<string, ClaudeSessionNode>,
+	resumeAnchorUuid: string,
+	allowedIds?: Set<string>,
+): Set<string> {
+	const seenToolUseIds = new Set<string>();
+	const seenToolResultIds = new Set<string>();
+	for (const uuid of getPathToRootUuids(nodes, resumeAnchorUuid)) {
+		const node = nodes.get(uuid);
+		if (!node) continue;
+		for (const id of node.toolUseIds) {
+			if (!allowedIds || allowedIds.has(id)) {
+				seenToolUseIds.add(id);
+			}
+		}
+		for (const id of node.toolResultIds) {
+			if (!allowedIds || allowedIds.has(id)) {
+				seenToolResultIds.add(id);
+			}
+		}
+	}
+	return new Set([...seenToolUseIds].filter((id) => !seenToolResultIds.has(id)));
+}
+
+function collectClaudeSessionNodes(sessionId: string, cwd: string): Map<string, ClaudeSessionNode> {
+	const nodes = new Map<string, ClaudeSessionNode>();
+	try {
+		const currentSessionFilePath = getSdkSessionFilePath(sessionId, cwd);
+		collectClaudeSessionNodesFromFile(currentSessionFilePath, nodes);
+
+		const projectDir = getClaudeProjectDir(cwd);
+		if (!existsSync(projectDir)) return nodes;
+		const extraSessionFiles = readdirSync(projectDir)
+			.filter((file) => file.endsWith(".jsonl"))
+			.map((file) => join(projectDir, file))
+			.filter((filePath) => filePath !== currentSessionFilePath)
+			.sort((a, b) => {
+				try {
+					return statSync(b).mtimeMs - statSync(a).mtimeMs;
+				} catch {
+					return 0;
+				}
+			})
+			.slice(0, 24);
+		for (const filePath of extraSessionFiles) {
+			collectClaudeSessionNodesFromFile(filePath, nodes);
+		}
+	} catch {
+		// ignore parse/read failures
+	}
+	return nodes;
+}
+
+function getExistingToolResultIds(sessionId: string, cwd: string, resumeAnchorUuid?: string): Set<string> {
+	const nodes = collectClaudeSessionNodes(sessionId, cwd);
+	return collectRecordedToolResultIdsFromNodes(nodes, resumeAnchorUuid);
+}
+
+function getReplayablePendingToolUseIds(
+	sessionId: string,
+	cwd: string,
+	resumeAnchorUuid: string,
+	pendingToolUseIds: Set<string>,
+): Set<string> {
+	if (pendingToolUseIds.size === 0) return new Set<string>();
+	const nodes = collectClaudeSessionNodes(sessionId, cwd);
+	const unresolvedIds = collectUnresolvedToolUseIdsOnAnchorPath(nodes, resumeAnchorUuid, pendingToolUseIds);
+	const existingResultIds = collectRecordedToolResultIdsFromNodes(nodes, resumeAnchorUuid);
+	return new Set([...unresolvedIds].filter((id) => !existingResultIds.has(id)));
+}
+
+function getPiSessionFilePath(sessionId: string, cwd: string): string | undefined {
+	const cacheKey = `${cwd}\u0000${sessionId}`;
+	const cachedPath = piSessionFilePathCache.get(cacheKey);
+	if (cachedPath && existsSync(cachedPath)) {
+		return cachedPath;
+	}
+
+	const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+	const sessionDir = join(homedir(), ".pi", "agent", "sessions", safePath);
+	if (!existsSync(sessionDir)) return undefined;
+
+	const suffix = `_${sessionId}.jsonl`;
+	const candidates = readdirSync(sessionDir)
+		.filter((file) => file.endsWith(suffix))
+		.map((file) => join(sessionDir, file));
+	if (!candidates.length) return undefined;
+
+	candidates.sort((a, b) => {
+		try {
+			return statSync(b).mtimeMs - statSync(a).mtimeMs;
+		} catch {
+			return 0;
+		}
+	});
+
+	const latestPath = candidates[0];
+	if (latestPath) {
+		piSessionFilePathCache.set(cacheKey, latestPath);
+	}
+	return latestPath;
+}
+
+function getAllSdkStateFromPiSession(sessionKey: string, sessionId: string, cwd: string): SdkSessionState | undefined {
+	const knownSessionFilePath = piSessionFileBySessionKey.get(sessionKey);
+	const sessionFilePath =
+		typeof knownSessionFilePath === "string" && knownSessionFilePath.trim().length > 0 && existsSync(knownSessionFilePath)
+			? knownSessionFilePath
+			: getPiSessionFilePath(sessionId, cwd);
+	if (!sessionFilePath || !existsSync(sessionFilePath)) return undefined;
+
+	const cacheKey = sessionFilePath;
+
+	let stats: { mtimeMs: number; size: number } | undefined;
+	try {
+		const stat = statSync(sessionFilePath);
+		stats = { mtimeMs: stat.mtimeMs, size: stat.size };
+	} catch {
+		return undefined;
+	}
+
+	const cached = piSessionSdkStateCache.get(cacheKey);
+	if (
+		cached &&
+		cached.sessionFilePath === sessionFilePath &&
+		cached.mtimeMs === stats.mtimeMs &&
+		cached.size === stats.size
+	) {
+		return cloneSdkState(cached.state);
+	}
+
+	const sdkEntries: Array<Record<string, any>> = [];
+	try {
+		const lines = readFileSync(sessionFilePath, "utf-8").split("\n");
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			if (!line.includes('"customType"')) continue;
+			if (!line.includes(SDK_SESSION_CUSTOM_TYPE)) continue;
+			try {
+				sdkEntries.push(JSON.parse(line) as Record<string, any>);
+			} catch {
+				// ignore malformed lines
+			}
+		}
+	} catch {
+		return undefined;
+	}
+
+	const state = buildSdkStateFromEntries(sdkEntries);
+	piSessionSdkStateCache.set(cacheKey, {
+		sessionFilePath,
+		mtimeMs: stats.mtimeMs,
+		size: stats.size,
+		state,
+	});
+	return cloneSdkState(state);
+}
+
+function syncAllSdkStateFromPiSession(sessionKey: string, sessionId: string, cwd: string): void {
+	const diskAllState = getAllSdkStateFromPiSession(sessionKey, sessionId, cwd);
+	if (!diskAllState) return;
+
+	const current = getSessionState(sessionKey);
+	if (!current) {
+		sdkStateBySessionKey.set(sessionKey, {
+			branch: cloneSdkState(diskAllState),
+			all: cloneSdkState(diskAllState),
+		});
+		return;
+	}
+
+	current.all = diskAllState;
+	if (!current.branch.sdkSessionId && diskAllState.sdkSessionId) {
+		current.branch.sdkSessionId = diskAllState.sdkSessionId;
+	}
+	sdkStateBySessionKey.set(sessionKey, current);
+}
+
+function setKnownPiSessionFileForSessionKey(sessionKey: string, sessionFilePath: string): void {
+	if (!sessionKey || !sessionFilePath) return;
+	piSessionFileBySessionKey.set(sessionKey, sessionFilePath);
+}
+
+function clearInternalStateForTests(): void {
+	sdkStateBySessionKey.clear();
+	piSessionSdkStateCache.clear();
+	piSessionFilePathCache.clear();
+	piSessionFileBySessionKey.clear();
 }
 
 function rewriteSkillsLocations(skillsBlock: string): string {
@@ -811,44 +1521,6 @@ const PI_LEVEL_TO_EFFORT: Record<ThinkingLevel, EffortLevel> = {
 	xhigh: "max",
 };
 
-/**
- * Resolves the Claude Code native binary shipped as a platform-specific
- * optional dependency of @anthropic-ai/claude-agent-sdk.
- *
- * We use createRequire bound to the SDK's own location so that nested
- * installs (pnpm strict, etc.) are found even when npm doesn't hoist the
- * optional dep.  The SDK's auto-resolution has known bugs (#296, #6867),
- * so we bypass it and pass the path explicitly via
- * options.pathToClaudeCodeExecutable.
- */
-function resolveClaudeCodeExecutable(): string {
-	if (process.env.CLAUDE_CODE_EXECUTABLE) {
-		return process.env.CLAUDE_CODE_EXECUTABLE;
-	}
-	const ext = process.platform === "win32" ? ".exe" : "";
-	// Linux: try musl first (Alpine, Void, etc.), then glibc fallback.
-	// See claude-agent-sdk-typescript#296 for the SDK-side bug.
-	const candidates =
-		process.platform === "linux"
-			? [
-				`@anthropic-ai/claude-agent-sdk-linux-${process.arch}-musl/claude${ext}`,
-				`@anthropic-ai/claude-agent-sdk-linux-${process.arch}/claude${ext}`,
-			]
-			: [`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/claude${ext}`];
-	const req = createRequire(import.meta.resolve("@anthropic-ai/claude-agent-sdk"));
-	for (const candidate of candidates) {
-		try {
-			return req.resolve(candidate);
-		} catch {
-			// try next candidate
-		}
-	}
-	throw new Error(
-		`Claude native binary not found for ${process.platform}-${process.arch}. ` +
-		`Reinstall @anthropic-ai/claude-agent-sdk without --omit=optional, or set CLAUDE_CODE_EXECUTABLE.`,
-	);
-}
-
 function parsePartialJson(input: string, fallback: Record<string, unknown>): Record<string, unknown> {
 	if (!input) return fallback;
 	try {
@@ -856,6 +1528,34 @@ function parsePartialJson(input: string, fallback: Record<string, unknown>): Rec
 	} catch {
 		return fallback;
 	}
+}
+
+function hasToolInputArgs(input: Record<string, unknown> | undefined): boolean {
+	if (!input || typeof input !== "object") return false;
+	return Object.keys(input).length > 0;
+}
+
+function sanitizeAssistantContentForEmit(output: AssistantMessage): void {
+	if (!Array.isArray(output.content) || output.content.length === 0) return;
+	const sanitized = output.content.filter((block) => {
+		if (block.type !== "toolCall") return true;
+		if ("index" in (block as any)) return false;
+		if ("partialJson" in (block as any)) return false;
+		if (!hasToolInputArgs((block as any).arguments)) return false;
+		return true;
+	});
+	(output.content as any) = sanitized;
+	if (output.stopReason === "toolUse") {
+		const hasToolCall = sanitized.some((block) => block.type === "toolCall");
+		if (!hasToolCall) {
+			output.stopReason = "stop";
+		}
+	}
+}
+
+function isIgnorableTransportWriteAfterCloseError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return error.message.includes("ProcessTransport is not ready for writing");
 }
 
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
@@ -884,13 +1584,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		let wasAborted = false;
 		const requestAbort = () => {
 			if (!sdkQuery) return;
-			void sdkQuery.interrupt().catch(() => {
-				try {
-					sdkQuery?.close();
-				} catch {
-					// ignore shutdown errors
-				}
-			});
+			try {
+				sdkQuery.close();
+			} catch {
+				// ignore shutdown errors
+			}
+		};
+		const requestClose = () => {
+			if (!sdkQuery) return;
+			try {
+				sdkQuery.close();
+			} catch {
+				// ignore shutdown errors
+			}
 		};
 		const onAbort = () => {
 			wasAborted = true;
@@ -918,18 +1624,144 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		let sawStreamEvent = false;
 		let sawToolCall = false;
 		let shouldStopEarly = false;
+		let abortedForToolCall = false;
+		const pendingToolUseIds = new Set<string>();
+		const announcedToolCallIndices = new Set<number>();
+		const emittedToolCallDeltaIndices = new Set<number>();
+		const clearStaleBlockIndex = (eventIndex: number) => {
+			for (const existingBlock of blocks) {
+				if ((existingBlock as any).index === eventIndex) {
+					delete (existingBlock as any).index;
+				}
+			}
+		};
+		const findLatestBlockIndex = (eventIndex: number) => {
+			for (let i = blocks.length - 1; i >= 0; i -= 1) {
+				if ((blocks[i] as any).index === eventIndex) return i;
+			}
+			return -1;
+		};
 
 		try {
 			const { sdkTools, customTools, customToolNameToSdk, customToolNameToPi } = resolveSdkTools(context);
-			const sessionKey = getSessionKeyFromStreamOptions(options);
-			if (sessionKey) {
-				reconcileCompletedToolCallsWithContext(sessionKey, context);
-			}
-			const toolWatchNote = buildToolWatchPromptNote(sessionKey, context, customToolNameToSdk);
-			const promptBlocks = buildPromptBlocks(context, customToolNameToSdk, toolWatchNote);
-			const prompt = buildPromptStream(promptBlocks);
 
 			const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
+			const piSessionId = (options as { sessionId?: string } | undefined)?.sessionId;
+			const sessionKey = buildSessionKey(options, cwd);
+			if (sessionKey && typeof piSessionId === "string" && piSessionId.trim().length > 0) {
+				syncAllSdkStateFromPiSession(sessionKey, piSessionId.trim(), cwd);
+			}
+			const sessionState = sessionKey ? getSessionState(sessionKey) : undefined;
+			const branchState = sessionState?.branch;
+			const allState = sessionState?.all;
+			const supportsImages = model.input?.includes("image") ?? true;
+
+			let resumeSessionId: string | undefined;
+			let resumeSessionAt: string | undefined;
+			let forkSession: boolean | undefined;
+			let prompt: AsyncIterable<SDKUserMessage> | string | undefined;
+			let resumeTailMessages: Context["messages"] | undefined;
+			let resumeTailAllowedToolUseIds: Set<string> | undefined;
+
+			if (!branchState?.sdkSessionId) {
+				prompt = buildPromptStream(buildPromptBlocks(context, customToolNameToSdk));
+			} else {
+				const lastSdkInfo = findLastSdkAssistantInfo(context.messages, branchState);
+				if (!lastSdkInfo) {
+					prompt = buildPromptStream(buildPromptBlocks(context, customToolNameToSdk));
+				} else {
+					resumeSessionId = branchState.sdkSessionId;
+					resumeSessionAt = lastSdkInfo.uuid;
+					resumeTailMessages = context.messages.slice(lastSdkInfo.index + 1);
+					const tailPlan = analyzeResumeTailMessages(resumeTailMessages, branchState.pendingToolUseTimestamp);
+					let tailAllowedToolUseIds = tailPlan.tailAllowedToolUseIds;
+					if (tailPlan.shouldUseSummaryPrompt) {
+						const summaryText = buildHistoricalSummary(tailPlan.summaryMessages, customToolNameToSdk);
+						prompt = buildPromptWithSummary(summaryText, tailPlan.userMessage, supportsImages);
+					}
+
+					const forkPlan = computeResumeForkPlan(branchState, allState);
+					if (forkPlan.resumeSessionAt) {
+						resumeSessionAt = forkPlan.resumeSessionAt;
+					}
+					if (forkPlan.forkSession !== undefined) {
+						forkSession = forkPlan.forkSession;
+					}
+					if (branchState.pendingToolUseTimestamp != null) {
+						const pendingUuid = branchState.uuidByAssistantTimestamp.get(branchState.pendingToolUseTimestamp);
+						let pendingToolUseIdSet = new Set(branchState.pendingToolUseIds ?? []);
+						if (resumeSessionId && pendingUuid && pendingToolUseIdSet.size > 0) {
+							pendingToolUseIdSet = getReplayablePendingToolUseIds(
+								resumeSessionId,
+								cwd,
+								pendingUuid,
+								pendingToolUseIdSet,
+							);
+						}
+						const canReplayStructuredToolResults =
+							Boolean(pendingUuid) &&
+							resumeSessionAt === pendingUuid &&
+							pendingToolUseIdSet.size > 0;
+						if (canReplayStructuredToolResults) {
+							if (!tailAllowedToolUseIds) {
+								tailAllowedToolUseIds = pendingToolUseIdSet;
+							} else {
+								tailAllowedToolUseIds = new Set(
+									[...tailAllowedToolUseIds].filter((id) => pendingToolUseIdSet.has(id)),
+								);
+							}
+						} else {
+							// Avoid emitting raw tool_result blocks without guaranteed matching tool_use context.
+							// Fallback to textual replay summaries instead.
+							tailAllowedToolUseIds = new Set<string>();
+						}
+						if (resumeSessionId && tailAllowedToolUseIds && tailAllowedToolUseIds.size > 0) {
+							const existingToolResultIds = getExistingToolResultIds(resumeSessionId, cwd, resumeSessionAt);
+							if (existingToolResultIds.size > 0) {
+								tailAllowedToolUseIds = new Set(
+									[...tailAllowedToolUseIds].filter((id) => !existingToolResultIds.has(id)),
+								);
+							}
+						}
+						if (!tailPlan.tailHasAssistant) {
+							prompt = buildResumePromptFromTail(resumeTailMessages, supportsImages, tailAllowedToolUseIds);
+						}
+						persistSdkEntry(sessionKey, {
+							providerId: PROVIDER_ID,
+							pendingToolUseTimestamp: null,
+							pendingToolUseIds: null,
+						});
+					} else {
+						if (resumeSessionId && tailAllowedToolUseIds && tailAllowedToolUseIds.size > 0) {
+							const existingToolResultIds = getExistingToolResultIds(resumeSessionId, cwd, resumeSessionAt);
+							if (existingToolResultIds.size > 0) {
+								tailAllowedToolUseIds = new Set(
+									[...tailAllowedToolUseIds].filter((id) => !existingToolResultIds.has(id)),
+								);
+							}
+						}
+						if (!tailPlan.tailHasAssistant) {
+							prompt = buildResumePromptFromTail(resumeTailMessages, supportsImages, tailAllowedToolUseIds);
+						}
+					}
+					resumeTailAllowedToolUseIds = tailAllowedToolUseIds;
+				}
+
+			}
+
+			if (prompt === undefined) {
+				if (hasReplayableTailMessages(resumeTailMessages)) {
+					prompt = buildResumePromptFromTail(
+						resumeTailMessages,
+						supportsImages,
+						resumeTailAllowedToolUseIds ?? new Set<string>(),
+					);
+				} else {
+					prompt = "Continue.";
+				}
+			}
+
+			const useResume = Boolean(resumeSessionId);
 
 			const mcpServers = buildCustomToolServers(customTools);
 			const providerSettings = loadProviderSettings();
@@ -952,16 +1784,26 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 			const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 				cwd,
-				model: model.id,
 				tools: sdkTools,
-				permissionMode: "dontAsk",
+				permissionMode: "default",
 				includePartialMessages: true,
-				canUseTool: async () => ({
-					behavior: "deny",
-					message: TOOL_EXECUTION_DENIED_MESSAGE,
-				}),
-				systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend ? systemPromptAppend : undefined },
-				pathToClaudeCodeExecutable: resolveClaudeCodeExecutable(),
+				persistSession: true,
+				...(useResume && resumeSessionId ? { resume: resumeSessionId } : {}),
+				...(useResume && resumeSessionAt ? { resumeSessionAt } : {}),
+				...(useResume && forkSession ? { forkSession } : {}),
+				canUseTool: async (_toolName, _input, permissionOptions) => {
+					return {
+						behavior: "deny" as const,
+						message: TOOL_EXECUTION_DENIED_MESSAGE,
+						interrupt: true,
+						toolUseID: permissionOptions.toolUseID,
+					};
+				},
+				systemPrompt: {
+					type: "preset",
+					preset: "claude_code",
+					append: systemPromptAppend ? systemPromptAppend : undefined,
+				},
 				...(settingSources ? { settingSources } : {}),
 				...(extraArgs ? { extraArgs } : {}),
 				...(mcpServers ? { mcpServers } : {}),
@@ -983,21 +1825,56 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			});
 
 			if (wasAborted) {
-				requestAbort();
+				requestClose();
 			}
 
 			for await (const message of sdkQuery) {
+				if (wasAborted || options?.signal?.aborted) {
+					requestClose();
+					break;
+				}
 				if (!started) {
 					stream.push({ type: "start", partial: output });
 					started = true;
 				}
 
 				switch (message.type) {
+					case "system": {
+						const systemMessage = message as { subtype?: string; session_id?: string };
+						if (systemMessage.subtype === "init" && systemMessage.session_id) {
+							persistSdkEntry(sessionKey, {
+								providerId: PROVIDER_ID,
+								sdkSessionId: systemMessage.session_id,
+							});
+						}
+						break;
+					}
+					case "assistant": {
+						const assistantMessage = message as { message?: { role?: string }; uuid?: string; session_id?: string; parent_tool_use_id?: string | null };
+						if (assistantMessage.message?.role === "assistant" && !assistantMessage.parent_tool_use_id) {
+							if (assistantMessage.uuid) {
+								persistSdkEntry(sessionKey, {
+									providerId: PROVIDER_ID,
+									sdkSessionId: assistantMessage.session_id,
+									sdkAssistantUuid: assistantMessage.uuid,
+									assistantTimestamp: output.timestamp,
+								});
+							}
+						}
+						break;
+					}
 					case "stream_event": {
 						sawStreamEvent = true;
 						const event = (message as SDKMessage & { event: any }).event;
 
 						if (event?.type === "message_start") {
+							for (const existingBlock of blocks) {
+								if ("index" in (existingBlock as any)) {
+									delete (existingBlock as any).index;
+								}
+							}
+							announcedToolCallIndices.clear();
+							emittedToolCallDeltaIndices.clear();
 							const usage = event.message?.usage;
 							output.usage.input = usage?.input_tokens ?? 0;
 							output.usage.output = usage?.output_tokens ?? 0;
@@ -1010,6 +1887,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						}
 
 						if (event?.type === "content_block_start") {
+							clearStaleBlockIndex(event.index);
 							if (event.content_block?.type === "text") {
 								const block = { type: "text", text: "", index: event.index } as const;
 								output.content.push(block);
@@ -1019,24 +1897,35 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 								output.content.push(block);
 								stream.push({ type: "thinking_start", contentIndex: output.content.length - 1, partial: output });
 							} else if (event.content_block?.type === "tool_use") {
-								sawToolCall = true;
+								const inputArgs = (event.content_block.input as Record<string, unknown>) ?? {};
 								const block = {
 									type: "toolCall",
 									id: event.content_block.id,
 									name: mapToolName(event.content_block.name, customToolNameToPi),
-									arguments: (event.content_block.input as Record<string, unknown>) ?? {},
+									arguments: inputArgs,
 									partialJson: "",
 									index: event.index,
 								} as const;
 								output.content.push(block);
-								stream.push({ type: "toolcall_start", contentIndex: output.content.length - 1, partial: output });
+								if (hasToolInputArgs(inputArgs)) {
+									const contentIndex = output.content.length - 1;
+									announcedToolCallIndices.add(event.index);
+									emittedToolCallDeltaIndices.add(event.index);
+									stream.push({ type: "toolcall_start", contentIndex, partial: output });
+									stream.push({
+										type: "toolcall_delta",
+										contentIndex,
+										delta: JSON.stringify(inputArgs),
+										partial: output,
+									});
+								}
 							}
 							break;
 						}
 
 						if (event?.type === "content_block_delta") {
 							if (event.delta?.type === "text_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
+								const index = findLatestBlockIndex(event.index);
 								const block = blocks[index];
 								if (block?.type === "text") {
 									block.text += event.delta.text;
@@ -1048,7 +1937,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									});
 								}
 							} else if (event.delta?.type === "thinking_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
+								const index = findLatestBlockIndex(event.index);
 								const block = blocks[index];
 								if (block?.type === "thinking") {
 									block.thinking += event.delta.thinking;
@@ -1060,20 +1949,28 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									});
 								}
 							} else if (event.delta?.type === "input_json_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
+								const index = findLatestBlockIndex(event.index);
 								const block = blocks[index];
 								if (block?.type === "toolCall") {
 									block.partialJson += event.delta.partial_json;
 									block.arguments = parsePartialJson(block.partialJson, block.arguments);
-									stream.push({
-										type: "toolcall_delta",
-										contentIndex: index,
-										delta: event.delta.partial_json,
-										partial: output,
-									});
+									const hasArgs = hasToolInputArgs(block.arguments as Record<string, unknown>);
+									if (hasArgs && !announcedToolCallIndices.has(event.index)) {
+										announcedToolCallIndices.add(event.index);
+										stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+									}
+									if (hasArgs && !emittedToolCallDeltaIndices.has(event.index)) {
+										emittedToolCallDeltaIndices.add(event.index);
+										stream.push({
+											type: "toolcall_delta",
+											contentIndex: index,
+											delta: JSON.stringify(block.arguments),
+											partial: output,
+										});
+									}
 								}
 							} else if (event.delta?.type === "signature_delta") {
-								const index = blocks.findIndex((block) => block.index === event.index);
+								const index = findLatestBlockIndex(event.index);
 								const block = blocks[index];
 								if (block?.type === "thinking") {
 									block.thinkingSignature = (block.thinkingSignature ?? "") + event.delta.signature;
@@ -1083,7 +1980,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						}
 
 						if (event?.type === "content_block_stop") {
-							const index = blocks.findIndex((block) => block.index === event.index);
+							const index = findLatestBlockIndex(event.index);
 							const block = blocks[index];
 							if (!block) break;
 							delete (block as any).index;
@@ -1102,25 +1999,51 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 									partial: output,
 								});
 							} else if (block.type === "toolCall") {
-								sawToolCall = true;
 								block.arguments = mapToolArgs(
 									block.name,
 									parsePartialJson(block.partialJson, block.arguments),
 									allowSkillAliasRewrite,
 								);
+								const hasArgs = hasToolInputArgs(block.arguments as Record<string, unknown>);
+								if (!hasArgs) {
+									delete (block as any).partialJson;
+									delete (block as any).index;
+									(output.content as any).splice(index, 1);
+									announcedToolCallIndices.delete(event.index);
+									emittedToolCallDeltaIndices.delete(event.index);
+									break;
+								}
+								if (!announcedToolCallIndices.has(event.index)) {
+									announcedToolCallIndices.add(event.index);
+									stream.push({ type: "toolcall_start", contentIndex: index, partial: output });
+								}
+								if (!emittedToolCallDeltaIndices.has(event.index)) {
+									emittedToolCallDeltaIndices.add(event.index);
+									stream.push({
+										type: "toolcall_delta",
+										contentIndex: index,
+										delta: JSON.stringify(block.arguments),
+										partial: output,
+									});
+								}
+								sawToolCall = true;
 								delete (block as any).partialJson;
+								pendingToolUseIds.add(block.id);
 								stream.push({
 									type: "toolcall_end",
 									contentIndex: index,
 									toolCall: block,
 									partial: output,
 								});
+								announcedToolCallIndices.delete(event.index);
+								emittedToolCallDeltaIndices.delete(event.index);
 							}
 							break;
 						}
 
 						if (event?.type === "message_delta") {
-							output.stopReason = mapStopReason(event.delta?.stop_reason);
+							const stopReason = mapStopReason(event.delta?.stop_reason);
+							output.stopReason = stopReason;
 							const usage = event.usage ?? {};
 							if (usage.input_tokens != null) output.usage.input = usage.input_tokens;
 							if (usage.output_tokens != null) output.usage.output = usage.output_tokens;
@@ -1135,6 +2058,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 						if (event?.type === "message_stop" && sawToolCall) {
 							output.stopReason = "toolUse";
 							shouldStopEarly = true;
+							if (!abortedForToolCall) {
+								abortedForToolCall = true;
+								persistSdkEntry(sessionKey, {
+									providerId: PROVIDER_ID,
+									pendingToolUseTimestamp: output.timestamp,
+									pendingToolUseIds: Array.from(pendingToolUseIds),
+								});
+							}
 							break;
 						}
 
@@ -1154,6 +2085,17 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				}
 			}
 
+			if (output.stopReason === "toolUse" && sawToolCall && !abortedForToolCall) {
+				abortedForToolCall = true;
+				persistSdkEntry(sessionKey, {
+					providerId: PROVIDER_ID,
+					pendingToolUseTimestamp: output.timestamp,
+					pendingToolUseIds: Array.from(pendingToolUseIds),
+				});
+			}
+
+			sanitizeAssistantContentForEmit(output);
+
 			if (wasAborted || options?.signal?.aborted) {
 				output.stopReason = "aborted";
 				output.errorMessage = "Operation aborted";
@@ -1169,8 +2111,19 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			});
 			stream.end();
 		} catch (error) {
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = error instanceof Error ? error.message : String(error);
+			sanitizeAssistantContentForEmit(output);
+			if (output.stopReason === "toolUse" && isIgnorableTransportWriteAfterCloseError(error)) {
+				stream.push({
+					type: "done",
+					reason: "toolUse",
+					message: output,
+				});
+				stream.end();
+				return;
+			}
+			const aborted = Boolean(wasAborted || options?.signal?.aborted);
+			output.stopReason = aborted ? "aborted" : "error";
+			output.errorMessage = aborted ? "Operation aborted" : error instanceof Error ? error.message : String(error);
 			stream.push({ type: "error", reason: output.stopReason as "aborted" | "error", error: output });
 			stream.end();
 		} finally {
@@ -1185,57 +2138,22 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 }
 
 export default function (pi: ExtensionAPI) {
-	const refreshToolWatchState = (
-		ctx: {
-			sessionManager?: { getSessionId?: () => string; getBranch?: () => Array<Record<string, any>> };
-		},
-	) => {
-		const sessionKey = getSessionKeyFromContext(ctx);
-		if (!sessionKey) return;
-		const entries = ctx.sessionManager?.getBranch?.() ?? [];
-		hydrateToolWatchStateFromEntries(sessionKey, entries);
-	};
+	extensionApi = pi;
 
 	pi.on("session_start", (_event, ctx) => {
-		refreshToolWatchState(ctx);
+		refreshSessionState(ctx);
+	});
+
+	pi.on("session_switch", (_event, ctx) => {
+		refreshSessionState(ctx);
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
-		refreshToolWatchState(ctx);
+		refreshSessionState(ctx);
 	});
 
-	pi.on("session_shutdown", (_event, ctx) => {
-		const sessionKey = getSessionKeyFromContext(ctx);
-		if (!sessionKey) return;
-		toolWatchStateBySession.delete(sessionKey);
-	});
-
-	pi.on("tool_execution_end", (event, ctx) => {
-		const provider = ctx.model?.provider;
-		if (provider !== PROVIDER_ID) return;
-		const sessionKey = getSessionKeyFromContext(ctx);
-		if (!sessionKey) return;
-
-		const timestamp = Date.now();
-		const content = extractToolExecutionContent(event.result);
-		const isError = event.isError === true;
-
-		trackCompletedToolCall(sessionKey, {
-			toolCallId: event.toolCallId,
-			toolName: event.toolName,
-			content,
-			isError,
-			timestamp,
-		});
-
-		pi.appendEntry<ToolWatchCustomEntryData>(TOOL_WATCH_CUSTOM_TYPE, {
-			type: "tool_execution_end",
-			toolCallId: event.toolCallId,
-			toolName: event.toolName,
-			content,
-			isError,
-			timestamp,
-		});
+	pi.on("session_fork", (_event, ctx) => {
+		refreshSessionState(ctx);
 	});
 
 	pi.registerProvider(PROVIDER_ID, {
@@ -1246,3 +2164,24 @@ export default function (pi: ExtensionAPI) {
 		streamSimple: streamClaudeAgentSdk,
 	});
 }
+
+export const __test = {
+	analyzeResumeTailMessages,
+	computeResumeForkPlan,
+	buildHistoricalSummary,
+	buildPromptWithSummary,
+	buildSdkStateFromEntries,
+	syncAllSdkStateFromPiSession,
+	getSessionState,
+	setKnownPiSessionFileForSessionKey,
+	clearInternalStateForTests,
+	buildResumePromptFromTail,
+	hasReplayableTailMessages,
+	findLastSdkAssistantInfo,
+	isErroredAssistantMessage,
+	sanitizeAssistantContentForEmit,
+	isIgnorableTransportWriteAfterCloseError,
+	normalizeClaudeProjectDirName,
+	collectRecordedToolResultIdsFromNodes,
+	collectUnresolvedToolUseIdsOnAnchorPath,
+};
