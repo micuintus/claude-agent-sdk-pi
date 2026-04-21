@@ -931,7 +931,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					high: "high",
 					xhigh: "xhigh",
 				};
-				queryOptions.thinking = { type: "adaptive" } satisfies ThinkingConfig;
+				queryOptions.thinking = { type: "adaptive", display: "summarized" } satisfies ThinkingConfig;
 				queryOptions.effort = effortMap[options.reasoning];
 			} else if (maxThinkingTokens != null) {
 				queryOptions.maxThinkingTokens = maxThinkingTokens;
