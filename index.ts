@@ -1,6 +1,6 @@
 import { calculateCost, createAssistantMessageEventStream, getModels, type AssistantMessage, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type Tool } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { createSdkMcpServer, query, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, type SDKMessage, type SDKUserMessage, type SettingSource, type ThinkingConfig, type EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, CacheControlEphemeral, ContentBlockParam, ImageBlockParam, MessageParam, TextBlockParam } from "@anthropic-ai/sdk/resources";
 import { pascalCase } from "change-case";
 import { existsSync, readFileSync } from "fs";
@@ -907,7 +907,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			};
 
 			const maxThinkingTokens = mapThinkingTokens(options?.reasoning, model.id, options?.thinkingBudgets);
-			if (maxThinkingTokens != null) {
+			const isAdaptiveModel = model.id.includes("opus-4-7") || model.id.includes("opus-4.7") || model.id.includes("opus-4-6") || model.id.includes("opus-4.6") || model.id.includes("sonnet-4-6") || model.id.includes("sonnet-4.6");
+			if (isAdaptiveModel && options?.reasoning) {
+				const effortMap: Record<ThinkingLevel, EffortLevel> = {
+					minimal: "low",
+					low: "low",
+					medium: "medium",
+					high: "high",
+					xhigh: "xhigh",
+				};
+				queryOptions.thinking = { type: "adaptive" } satisfies ThinkingConfig;
+				queryOptions.effort = effortMap[options.reasoning];
+			} else if (maxThinkingTokens != null) {
 				queryOptions.maxThinkingTokens = maxThinkingTokens;
 			}
 
