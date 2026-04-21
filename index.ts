@@ -6,8 +6,23 @@ import { pascalCase } from "change-case";
 import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, join, relative, resolve } from "path";
+import { fileURLToPath } from "url";
 
 const PROVIDER_ID = "claude-agent-sdk";
+
+function resolveClaudeCodeExecutable(): string | undefined {
+	const platform = process.platform;
+	const arch = process.arch;
+	const pkgName = `@anthropic-ai/claude-agent-sdk-${platform}-${arch}`;
+	try {
+		const pkgPath = dirname(fileURLToPath(import.meta.resolve(`${pkgName}/package.json`)));
+		const exePath = join(pkgPath, "claude");
+		if (existsSync(exePath)) return exePath;
+	} catch {
+		// optional dependency not installed
+	}
+	return undefined;
+}
 
 const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 	read: "read",
@@ -879,15 +894,14 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
 			const allowSkillAliasRewrite = Boolean(skillsAppend);
 
-			const settingSources: SettingSource[] | undefined = appendSystemPrompt
-				? undefined
-				: providerSettings.settingSources ?? ["user", "project"];
+			const settingSources: SettingSource[] | undefined = providerSettings.settingSources
+				?? (appendSystemPrompt ? undefined : ["user", "project"]);
 
 			// Claude Code will auto-load MCP servers from ~/.claude.json and .mcp.json when settingSources is enabled.
 			// In this provider, Claude Code tool execution is denied and pi executes tools instead, so auto-loaded MCP
 			// tools are pure token overhead. Pass --strict-mcp-config to ignore all MCP configs except those explicitly
 			// provided via the SDK (mcpServers option).
-			const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;
+			const strictMcpConfigEnabled = providerSettings.strictMcpConfig ?? !appendSystemPrompt;
 			const extraArgs = strictMcpConfigEnabled ? { "strict-mcp-config": null } : undefined;
 
 			const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
@@ -901,6 +915,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					message: TOOL_EXECUTION_DENIED_MESSAGE,
 				}),
 				systemPrompt: { type: "preset", preset: "claude_code", append: systemPromptAppend ? systemPromptAppend : undefined },
+				pathToClaudeCodeExecutable: resolveClaudeCodeExecutable(),
 				...(settingSources ? { settingSources } : {}),
 				...(extraArgs ? { extraArgs } : {}),
 				...(mcpServers ? { mcpServers } : {}),
