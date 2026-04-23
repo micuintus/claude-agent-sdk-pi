@@ -368,7 +368,7 @@ function buildPromptBlocks(
 		}
 
 		if (message.role === "assistant") {
-			pushPrefix("ASSISTANT:");
+			pushPrefix("[Assistant]:");
 			const text = contentToText(message.content, customToolNameToSdk);
 			if (text.length > 0) {
 				pushText(text);
