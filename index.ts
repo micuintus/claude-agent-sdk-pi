@@ -300,100 +300,48 @@ function buildPromptBlocks(
 	customToolNameToSdk: Map<string, string> | undefined,
 	toolWatchNote?: string,
 ): ContentBlockParam[] {
-	const blocks: ContentBlockParam[] = [];
-
-	const pushText = (text: string) => {
-		blocks.push({ type: "text", text });
+	const getText = (content: unknown) => {
+		if (typeof content === "string") return content;
+		if (!Array.isArray(content)) return "";
+		return content.filter((b: any) => b.type === "text").map((b: any) => b.text ?? "").join("\n");
 	};
 
-	const pushImage = (image: ImageContent) => {
-		blocks.push({
-			type: "image",
-			source: {
-				type: "base64",
-				media_type: image.mimeType as Base64ImageSource["media_type"],
-				data: image.data,
-			},
-		});
-	};
-
-	const pushPrefix = (label: string) => {
-		const prefix = `${blocks.length ? "\n\n" : ""}${label}\n`;
-		pushText(prefix);
-	};
-
-	const appendContentBlocks = (
-		content:
-			| string
-			| Array<{
-					type: string;
-					text?: string;
-					data?: string;
-					mimeType?: string;
-				}>,
-	): boolean => {
-		if (typeof content === "string") {
-			if (content.length > 0) {
-				pushText(content);
-				return content.trim().length > 0;
-			}
-			return false;
+	const history = context.messages.map((m) => {
+		if (m.role === "user") {
+			return { speaker: "user", content: getText(m.content) || "(see attached image)" };
 		}
-		if (!Array.isArray(content)) return false;
-		let hasText = false;
-		for (const block of content) {
-			if (block.type === "text") {
-				const text = block.text ?? "";
-				if (text.trim().length > 0) hasText = true;
-				pushText(text);
-				continue;
-			}
-			if (block.type === "image") {
-				pushImage(block as ImageContent);
-				continue;
-			}
-			pushText(`[${block.type}]`);
+		if (m.role === "assistant") {
+			const entry: Record<string, unknown> = { speaker: "assistant" };
+			const text = getText(m.content);
+			const thinking = Array.isArray(m.content)
+				? m.content.filter((b: any) => b.type === "thinking").map((b: any) => b.thinking).join("\n")
+				: "";
+			const tools = Array.isArray(m.content)
+				? m.content.filter((b: any) => b.type === "toolCall").map((b: any) => ({
+						name: mapPiToolNameToSdk(b.name, customToolNameToSdk),
+						id: b.id,
+						args: b.arguments,
+					}))
+				: [];
+			if (text) entry.content = text;
+			if (thinking) entry.thinking = thinking;
+			if (tools.length > 0) entry.tool_calls = tools;
+			return entry;
 		}
-		return hasText;
-	};
+		return { speaker: "tool", tool_call_id: m.toolCallId, result: getText(m.content) || "(see attached image)" };
+	});
 
-	for (const message of context.messages) {
-		if (message.role === "user") {
-			pushPrefix("USER:");
-			const hasText = appendContentBlocks(message.content);
-			if (!hasText) {
-				pushText("(see attached image)");
-			}
-			continue;
-		}
-
-		if (message.role === "assistant") {
-			pushPrefix("ASSISTANT:");
-			const text = contentToText(message.content, customToolNameToSdk);
-			if (text.length > 0) {
-				pushText(text);
-			}
-			continue;
-		}
-
-		if (message.role === "toolResult") {
-			const header = `TOOL RESULT (historical ${mapPiToolNameToSdk(message.toolName, customToolNameToSdk)}, id=${message.toolCallId}):`;
-			pushPrefix(header);
-			const hasText = appendContentBlocks(message.content);
-			if (!hasText) {
-				pushText("(see attached image)");
-			}
-		}
+	const parts = [
+		"You are in a conversation. Below is the history in JSON format.",
+		"Respond to the last user message in plain text.",
+		'NEVER output markers like "[Assistant]:", "USER:", "Historical tool call", or JSON in your response.',
+	];
+	if (toolWatchNote?.trim().length) {
+		parts.push("", "Recovered tool results from other branches:", toolWatchNote.trim());
 	}
+	parts.push("", "Conversation history:", "```json", JSON.stringify(history, null, 2), "```");
 
-	if (toolWatchNote && toolWatchNote.trim().length > 0) {
-		pushPrefix("RECOVERED TOOL RESULTS:");
-		pushText(toolWatchNote.trim());
-	}
-
-	if (!blocks.length) return [{ type: "text", text: "" }];
-
-	return blocks;
+	return [{ type: "text", text: parts.join("\n") }];
 }
 
 function buildPromptStream(promptBlocks: ContentBlockParam[]): AsyncIterable<SDKUserMessage> {
@@ -412,34 +360,6 @@ function buildPromptStream(promptBlocks: ContentBlockParam[]): AsyncIterable<SDK
 	}
 
 	return generator();
-}
-
-function contentToText(
-	content:
-		| string
-		| Array<{
-			type: string;
-			text?: string;
-			thinking?: string;
-			name?: string;
-			arguments?: Record<string, unknown>;
-		}>,
-	customToolNameToSdk?: Map<string, string>,
-): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.map((block) => {
-			if (block.type === "text") return block.text ?? "";
-			if (block.type === "thinking") return block.thinking ?? "";
-			if (block.type === "toolCall") {
-				const args = block.arguments ? JSON.stringify(block.arguments) : "{}";
-				const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
-				return `Historical tool call (non-executable): ${toolName} args=${args}`;
-			}
-			return `[${block.type}]`;
-		})
-		.join("\n");
 }
 
 function mapPiToolNameToSdk(name?: string, customToolNameToSdk?: Map<string, string>): string {
