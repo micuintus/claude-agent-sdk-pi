@@ -156,30 +156,33 @@ function buildPromptBlocks(
 
 	for (const message of context.messages) {
 		if (message.role === "user") {
-			pushPrefix("USER:");
+			pushPrefix('<message role="user">');
 			const hasText = appendContentBlocks(message.content);
 			if (!hasText) {
 				pushText("(see attached image)");
 			}
+			pushText("\n</message>");
 			continue;
 		}
 
 		if (message.role === "assistant") {
-			pushPrefix("ASSISTANT:");
+			pushPrefix('<message role="assistant">');
 			const text = contentToText(message.content, customToolNameToSdk);
 			if (text.length > 0) {
 				pushText(text);
 			}
+			pushText("\n</message>");
 			continue;
 		}
 
 		if (message.role === "toolResult") {
-			const header = `TOOL RESULT (historical ${mapPiToolNameToSdk(message.toolName, customToolNameToSdk)}):`;
-			pushPrefix(header);
+			const toolName = mapPiToolNameToSdk(message.toolName, customToolNameToSdk);
+			pushPrefix(`<tool_result tool_use_id="${message.toolCallId}" tool_name="${toolName}">`);
 			const hasText = appendContentBlocks(message.content);
 			if (!hasText) {
 				pushText("(see attached image)");
 			}
+			pushText("\n</tool_result>");
 		}
 	}
 
@@ -213,6 +216,7 @@ function contentToText(
 			type: string;
 			text?: string;
 			thinking?: string;
+			id?: string;
 			name?: string;
 			arguments?: Record<string, unknown>;
 		}>,
@@ -223,11 +227,12 @@ function contentToText(
 	return content
 		.map((block) => {
 			if (block.type === "text") return block.text ?? "";
-			if (block.type === "thinking") return block.thinking ?? "";
+			if (block.type === "thinking") return `<thinking>\n${block.thinking ?? ""}\n</thinking>`;
 			if (block.type === "toolCall") {
 				const args = block.arguments ? JSON.stringify(block.arguments) : "{}";
 				const toolName = mapPiToolNameToSdk(block.name, customToolNameToSdk);
-				return `Historical tool call (non-executable): ${toolName} args=${args}`;
+				const idAttr = block.id ? ` id="${block.id}"` : "";
+				return `<tool_use${idAttr} name="${toolName}">${args}</tool_use>`;
 			}
 			return `[${block.type}]`;
 		})
@@ -320,27 +325,28 @@ function buildHistoricalSummary(messages: Context["messages"], customToolNameToS
 	for (const message of messages) {
 		if (message.role === "user") {
 			const text = contentToPlainText(message.content);
-			if (text.trim().length > 0) lines.push(`USER: ${text}`);
-			else lines.push("USER: (see attached image)");
+			if (text.trim().length > 0) lines.push(`<message role="user">${text}</message>`);
+			else lines.push('<message role="user">(see attached image)</message>');
 			continue;
 		}
 		if (message.role === "assistant") {
 			const text = contentToText(message.content, customToolNameToSdk);
-			if (text.trim().length > 0) lines.push(`ASSISTANT: ${text}`);
+			if (text.trim().length > 0) lines.push(`<message role="assistant">${text}</message>`);
 			continue;
 		}
 		if (message.role === "toolResult") {
 			const toolName = mapPiToolNameToSdk(message.toolName, customToolNameToSdk);
 			const text = contentToPlainText(message.content);
+			const openTag = `<tool_result tool_use_id="${message.toolCallId}" tool_name="${toolName}">`;
 			if (text.trim().length > 0) {
-				lines.push(`TOOL RESULT (historical ${toolName}): ${text}`);
+				lines.push(`${openTag}${text}</tool_result>`);
 			} else {
-				lines.push(`TOOL RESULT (historical ${toolName}): (see attached image)`);
+				lines.push(`${openTag}(see attached image)</tool_result>`);
 			}
 		}
 	}
 	if (!lines.length) return "";
-	return `Historical context (non-executable):\n${lines.join("\n")}`;
+	return `<historical_context>\n${lines.join("\n")}\n</historical_context>`;
 }
 
 function buildPromptWithSummary(
@@ -2166,6 +2172,7 @@ export default function (pi: ExtensionAPI) {
 }
 
 export const __test = {
+	buildPromptBlocks,
 	analyzeResumeTailMessages,
 	computeResumeForkPlan,
 	buildHistoricalSummary,

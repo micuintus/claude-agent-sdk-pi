@@ -172,8 +172,8 @@ test("compaction-like assistant text is preserved in historical summary", () => 
 		user("continue from here"),
 	]);
 
-	assert.match(summary, /ASSISTANT: ## Goal/);
-	assert.match(summary, /USER: continue from here/);
+	assert.match(summary, /<message role="assistant">## Goal/);
+	assert.match(summary, /<message role="user">continue from here<\/message>/);
 });
 
 test("tree/fork-style divergence (branch behind all) triggers Claude fork anchor", () => {
@@ -353,4 +353,56 @@ test("findLastSdkAssistantInfo skips errored assistant anchors", () => {
 	assert.equal(info?.uuid, "uuid-ok");
 	assert.equal(__test.isErroredAssistantMessage(badAssistant), true);
 	assert.equal(__test.isErroredAssistantMessage(okAssistant), false);
+});
+
+test("buildHistoricalSummary uses XML tags, not echoable prefixes", () => {
+	ts = 1;
+	const messages: Context["messages"] = [
+		user("hello"),
+		assistant("hi there"),
+		toolResult("toolu_1", "file.txt"),
+	];
+	const summary = __test.buildHistoricalSummary(messages);
+	assert.equal(summary.includes("ASSISTANT:"), false, "must not contain ASSISTANT: prefix");
+	assert.equal(summary.includes("USER:"), false, "must not contain USER: prefix");
+	assert.equal(summary.includes("TOOL RESULT (historical"), false, "must not contain TOOL RESULT prefix");
+	assert.equal(summary.includes("Historical context (non-executable)"), false, "must not contain Historical context prefix");
+	assert.equal(summary.includes('<message role="user">hello</message>'), true);
+	assert.equal(summary.includes('<message role="assistant">hi there</message>'), true);
+	assert.equal(summary.includes('<tool_result tool_use_id="toolu_1" tool_name="Read">file.txt</tool_result>'), true);
+	assert.equal(summary.startsWith("<historical_context>"), true);
+	assert.equal(summary.endsWith("</historical_context>"), true);
+});
+
+test("buildPromptBlocks uses XML tags, not echoable prefixes", () => {
+	ts = 1;
+	const messages: Context["messages"] = [
+		user("hello"),
+		{
+			role: "assistant",
+			content: [
+				{ type: "text", text: "hi" },
+				{ type: "toolCall", id: "toolu_1", name: "read", arguments: { path: "a" } },
+				{ type: "thinking", thinking: "planning..." },
+			],
+			api: "claude-agent-sdk",
+			provider: "claude-agent-sdk",
+			model: "claude-opus-4-6",
+			usage,
+			stopReason: "toolUse",
+			timestamp: nextTs(),
+		},
+		toolResult("toolu_1", "content"),
+	];
+	const blocks = __test.buildPromptBlocks({ messages, systemPrompt: undefined, customInstructions: undefined }, undefined);
+	const text = blocks.filter((b: any) => b.type === "text").map((b: any) => b.text).join("");
+	assert.equal(text.includes("ASSISTANT:"), false, "must not contain ASSISTANT: prefix");
+	assert.equal(text.includes("USER:"), false, "must not contain USER: prefix");
+	assert.equal(text.includes("Historical tool call (non-executable)"), false, "must not contain Historical tool call prefix");
+	assert.equal(text.includes("TOOL RESULT (historical"), false, "must not contain TOOL RESULT prefix");
+	assert.equal(text.includes('<message role="user">\nhello\n</message>'), true);
+	assert.equal(text.includes('<message role="assistant">'), true);
+	assert.equal(text.includes('<tool_use id="toolu_1" name="Read">{"path":"a"}</tool_use>'), true);
+	assert.equal(text.includes('<thinking>\nplanning...\n</thinking>'), true);
+	assert.equal(text.includes('<tool_result tool_use_id="toolu_1" tool_name="Read">\ncontent\n</tool_result>'), true);
 });
