@@ -651,6 +651,7 @@ function buildResumePromptFromTail(
 
 function isErroredAssistantMessage(message: Extract<Context["messages"][number], { role: "assistant" }>): boolean {
 	if (message.stopReason === "error") return true;
+	if (message.stopReason == null) return true;
 	if (typeof message.errorMessage === "string" && message.errorMessage.trim().length > 0) return true;
 	const text = contentToText(message.content).trim().toLowerCase();
 	if (!text) return false;
@@ -2093,8 +2094,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					}
 
 					case "result": {
-						if (!sawStreamEvent && message.subtype === "success") {
-							output.content.push({ type: "text", text: message.result || "" });
+						if (message.subtype === "success") {
+							if (!sawStreamEvent) {
+								output.content.push({ type: "text", text: message.result || "" });
+							}
+						} else {
+							output.stopReason = "error";
+							output.errorMessage = `Claude Code error: ${message.subtype}`;
 						}
 						break;
 					}

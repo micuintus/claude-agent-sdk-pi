@@ -355,6 +355,19 @@ test("findLastSdkAssistantInfo skips errored assistant anchors", () => {
 	assert.equal(__test.isErroredAssistantMessage(okAssistant), false);
 });
 
+test("isErroredAssistantMessage treats null/undefined stopReason as errored", () => {
+	const nullStop = { ...assistant("ok"), stopReason: null as any } as Extract<
+		Context["messages"][number],
+		{ role: "assistant" }
+	>;
+	const undefStop = { ...assistant("ok"), stopReason: undefined as any } as Extract<
+		Context["messages"][number],
+		{ role: "assistant" }
+	>;
+	assert.equal(__test.isErroredAssistantMessage(nullStop), true);
+	assert.equal(__test.isErroredAssistantMessage(undefStop), true);
+});
+
 test("buildHistoricalSummary uses XML tags, not echoable prefixes", () => {
 	ts = 1;
 	const messages: Context["messages"] = [
