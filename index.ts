@@ -1788,6 +1788,20 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			const strictMcpConfigEnabled = providerSettings.strictMcpConfig ?? !appendSystemPrompt;
 			const extraArgs = strictMcpConfigEnabled ? { "strict-mcp-config": null } : undefined;
 
+			// Validate resumeSessionAt still exists in the session file to avoid
+			// "No message found with message.uuid of: ..." SDK errors.
+			// The SDK only searches the specific session file, so restrict the
+			// guard to that file rather than scanning unrelated fork .jsonl files.
+			if (useResume && resumeSessionAt && resumeSessionId) {
+				const nodes = new Map<string, ClaudeSessionNode>();
+				const sessionFilePath = getSdkSessionFilePath(resumeSessionId, cwd);
+				collectClaudeSessionNodesFromFile(sessionFilePath, nodes);
+				if (!nodes.has(resumeSessionAt)) {
+					resumeSessionAt = undefined;
+					forkSession = undefined;
+				}
+			}
+
 			const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 				cwd,
 				tools: sdkTools,
