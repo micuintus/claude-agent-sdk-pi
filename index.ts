@@ -1591,19 +1591,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		let wasAborted = false;
 		const requestAbort = () => {
 			if (!sdkQuery) return;
-			try {
-				sdkQuery.close();
-			} catch {
-				// ignore shutdown errors
-			}
-		};
-		const requestClose = () => {
-			if (!sdkQuery) return;
-			try {
-				sdkQuery.close();
-			} catch {
-				// ignore shutdown errors
-			}
+			void sdkQuery.interrupt().catch(() => {
+				try {
+					sdkQuery?.close();
+				} catch {
+					// ignore shutdown errors
+				}
+			});
 		};
 		const onAbort = () => {
 			wasAborted = true;
@@ -1846,12 +1840,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			});
 
 			if (wasAborted) {
-				requestClose();
+				requestAbort();
 			}
 
 			for await (const message of sdkQuery) {
 				if (wasAborted || options?.signal?.aborted) {
-					requestClose();
+					requestAbort();
 					break;
 				}
 				if (!started) {
