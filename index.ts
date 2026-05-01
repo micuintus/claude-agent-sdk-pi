@@ -1565,6 +1565,17 @@ function isIgnorableTransportWriteAfterCloseError(error: unknown): boolean {
 	return error.message.includes("ProcessTransport is not ready for writing");
 }
 
+// SDK 0.2.123 surfaces a runtime-assembled diagnostic
+// ("[ede_diagnostic] result_type=… last_content_type=… stop_reason=…") as an
+// Error when interrupt() leaves a turn without a clean content+stop sequence.
+// The SDK wraps it as "Claude Code returned an error result: [ede_diagnostic] …",
+// so match by substring rather than prefix. Treat it as an abort instead of
+// letting the diagnostic reach the user.
+function isSdkRuntimeDiagnosticError(error: unknown): boolean {
+	if (!(error instanceof Error)) return false;
+	return error.message.includes("[ede_diagnostic]");
+}
+
 function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
@@ -2141,7 +2152,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				stream.end();
 				return;
 			}
-			const aborted = Boolean(wasAborted || options?.signal?.aborted);
+			const aborted = Boolean(wasAborted || options?.signal?.aborted) || isSdkRuntimeDiagnosticError(error);
 			output.stopReason = aborted ? "aborted" : "error";
 			output.errorMessage = aborted ? "Operation aborted" : error instanceof Error ? error.message : String(error);
 			stream.push({ type: "error", reason: output.stopReason as "aborted" | "error", error: output });
